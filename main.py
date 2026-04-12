@@ -39,6 +39,9 @@ console = Console()
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Podcasts"
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 MAX_CONCURRENT_DOWNLOADS = 3
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+}
 
 
 # ─── Hilfsfunktionen ─────────────────────────────────────────────────────────
@@ -85,7 +88,7 @@ def search_podcasts(query: str, limit: int = 10) -> list[dict]:
         "lang": "de_de",
     }
     try:
-        resp = requests.get(ITUNES_SEARCH_URL, params=params, timeout=10)
+        resp = requests.get(ITUNES_SEARCH_URL, params=params, headers=HTTP_HEADERS, timeout=10)
         resp.raise_for_status()
         results = resp.json().get("results", [])
         return [
@@ -208,7 +211,7 @@ def download_episode(episode: dict, download_dir: Path, progress, task_id) -> bo
             return True
 
     try:
-        resp = requests.get(url, stream=True, timeout=30)
+        resp = requests.get(url, stream=True, headers=HTTP_HEADERS, timeout=30)
         resp.raise_for_status()
 
         total = int(resp.headers.get("content-length", 0)) or episode.get("size", 0)
