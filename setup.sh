@@ -1,43 +1,51 @@
 #!/bin/bash
 set -e
 
-INSTALL_DIR="$HOME/Development/podcast-downloader"
-VENV_DIR="$INSTALL_DIR/venv"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV_DIR="$SCRIPT_DIR/venv"
 
 echo "🎧 Podcast Downloader – Installation"
 echo "======================================"
 echo ""
 
-echo "📁 Erstelle Installationsverzeichnis..."
-mkdir -p "$INSTALL_DIR"
+# ffmpeg für Whisper prüfen
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "⚠️  ffmpeg ist nicht installiert. Wird für Transkription benötigt."
+    if command -v brew >/dev/null 2>&1; then
+        read -rp "Jetzt via Homebrew installieren? [J/n] " reply
+        if [[ ! "$reply" =~ ^[Nn]$ ]]; then
+            brew install ffmpeg
+        fi
+    else
+        echo "   Bitte manuell installieren: https://ffmpeg.org (macOS: 'brew install ffmpeg')"
+    fi
+fi
 
 echo "🐍 Erstelle Virtual Environment..."
 python3 -m venv "$VENV_DIR"
 
-echo "📦 Installiere Python-Pakete..."
+echo "📦 Installiere Python-Pakete (inkl. openai-whisper – dauert beim ersten Mal)..."
 "$VENV_DIR/bin/pip" install --upgrade pip -q
-"$VENV_DIR/bin/pip" install requests feedparser rich -q
-
-echo "📄 Kopiere Skripte..."
-cp "$SCRIPT_DIR/main.py" "$INSTALL_DIR/"
+"$VENV_DIR/bin/pip" install -r "$SCRIPT_DIR/requirements.txt"
 
 # Wrapper-Skript
-echo "🔧 Erstelle Wrapper-Skript..."
-cat > "$INSTALL_DIR/run.sh" << 'EOF'
+if [[ ! -f "$SCRIPT_DIR/run.sh" ]]; then
+    echo "🔧 Erstelle Wrapper-Skript..."
+    cat > "$SCRIPT_DIR/run.sh" << 'EOF'
 #!/bin/bash
-SCRIPT_DIR="$HOME/Development/podcast-downloader"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 "$SCRIPT_DIR/venv/bin/python3" "$SCRIPT_DIR/main.py" "$@"
 EOF
-chmod +x "$INSTALL_DIR/run.sh"
+    chmod +x "$SCRIPT_DIR/run.sh"
+fi
 
 echo ""
 echo "✅ Installation abgeschlossen!"
 echo ""
 echo "Verwendung:"
-echo "  Interaktiver Modus:  $INSTALL_DIR/run.sh"
-echo "  Podcast suchen:      $INSTALL_DIR/run.sh --search \"Lage der Nation\""
-echo "  Feed herunterladen:  $INSTALL_DIR/run.sh --feed URL --episodes all"
+echo "  Interaktiver Modus:            $SCRIPT_DIR/run.sh"
+echo "  Podcast suchen:                $SCRIPT_DIR/run.sh --search \"Lage der Nation\""
+echo "  Alle Episoden + Transkription: $SCRIPT_DIR/run.sh --feed URL --episodes all --transcribe"
 echo ""
-echo "Tipp: Erstelle einen Alias in deiner ~/.zshrc:"
-echo "  alias podcast='$INSTALL_DIR/run.sh'"
+echo "Tipp: Alias in ~/.zshrc:"
+echo "  alias podcast='$SCRIPT_DIR/run.sh'"

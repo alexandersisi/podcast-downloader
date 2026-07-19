@@ -11,9 +11,12 @@ import re
 import sys
 import json
 import time
+import shutil
 import argparse
 import unicodedata
 from pathlib import Path
+from datetime import datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -39,6 +42,8 @@ console = Console()
 DEFAULT_DOWNLOAD_DIR = Path.home() / "Podcasts"
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 MAX_CONCURRENT_DOWNLOADS = 3
+DEFAULT_WHISPER_MODEL = "small"  # tiny/base/small/medium/large
+DEFAULT_WHISPER_LANGUAGE = "de"
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 }
@@ -52,6 +57,22 @@ def sanitize_filename(name: str) -> str:
     name = re.sub(r'[<>:"/\\|?*]', '', name)
     name = re.sub(r'\s+', ' ', name).strip()
     return name[:200]  # Max Länge begrenzen
+
+
+def format_pub_date(pub_date: str) -> str:
+    """Parst RSS-Datum und gibt YYYY-MM-DD zurück. Leer, wenn nicht parsebar."""
+    if not pub_date:
+        return ""
+    try:
+        return parsedate_to_datetime(pub_date).strftime("%Y-%m-%d")
+    except (TypeError, ValueError):
+        pass
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(pub_date[:len(fmt) + 2], fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ""
 
 
 def format_duration(seconds: int | None) -> str:
@@ -193,13 +214,15 @@ def download_episode(episode: dict, download_dir: Path, progress, task_id) -> bo
     if "." in url_path.split("/")[-1]:
         ext = "." + url_path.split("/")[-1].rsplit(".", 1)[-1]
 
-    prefix = ""
+    date_prefix = format_pub_date(episode.get("pub_date", ""))
+    ep_prefix = ""
     if episode.get("season_num") and episode.get("episode_num"):
-        prefix = f"S{episode['season_num']:>02s}E{episode['episode_num']:>02s} - "
+        ep_prefix = f"S{episode['season_num']:>02s}E{episode['episode_num']:>02s} - "
     elif episode.get("episode_num"):
-        prefix = f"E{episode['episode_num']:>02s} - "
+        ep_prefix = f"E{episode['episode_num']:>02s} - "
 
-    filename = sanitize_filename(f"{prefix}{episode['title']}") + ext
+    base = sanitize_filename(f"{ep_prefix}{episode['title']}")
+    filename = (f"{date_prefix} - " if date_prefix else "") + base + ext
     filepath = download_dir / filename
 
     # Bereits heruntergeladen?
@@ -234,7 +257,78 @@ def download_episode(episode: dict, download_dir: Path, progress, task_id) -> bo
         return False
 
 
-def download_episodes(episodes: list[dict], download_dir: Path):
+def episode_filepath(episode: dict, download_dir: Path) -> Path:
+    """Berechnet den Zielpfad einer Episode (gleiche Logik wie download_episode)."""
+    url = episode["url"]
+    ext = ".mp3"
+    parsed_url = urlparse(url)
+    url_path = parsed_url.path
+    if "." in url_path.split("/")[-1]:
+        ext = "." + url_path.split("/")[-1].rsplit(".", 1)[-1]
+
+    date_prefix = format_pub_date(episode.get("pub_date", ""))
+    ep_prefix = ""
+    if episode.get("season_num") and episode.get("episode_num"):
+        ep_prefix = f"S{episode['season_num']:>02s}E{episode['episode_num']:>02s} - "
+    elif episode.get("episode_num"):
+        ep_prefix = f"E{episode['episode_num']:>02s} - "
+
+    base = sanitize_filename(f"{ep_prefix}{episode['title']}")
+    filename = (f"{date_prefix} - " if date_prefix else "") + base + ext
+    return download_dir / filename
+
+
+def transcribe_file(audio_path: Path, model_name: str, language: str | None) -> bool:
+    """Transkribiert eine Audiodatei mit Whisper. Schreibt .txt und .srt daneben."""
+    txt_path = audio_path.with_suffix(".txt")
+    if txt_path.exists():
+        console.print(f"[dim]⏭  Transkript existiert: {txt_path.name}[/dim]")
+        return True
+
+    if not shutil.which("ffmpeg"):
+        console.print("[red]✗ ffmpeg fehlt. Bitte installieren: brew install ffmpeg[/red]")
+        return False
+
+    try:
+        import whisper  # type: ignore
+    except ImportError:
+        console.print("[red]✗ openai-whisper fehlt. Bitte setup.sh erneut ausführen.[/red]")
+        return False
+
+    console.print(f"[cyan]🎙️  Transkribiere ({model_name}): {audio_path.name}[/cyan]")
+    try:
+        model = whisper.load_model(model_name)
+        result = model.transcribe(str(audio_path), language=language, verbose=False)
+    except Exception as e:
+        console.print(f"[red]✗ Whisper-Fehler bei {audio_path.name}: {e}[/red]")
+        return False
+
+    txt_path.write_text(result.get("text", "").strip() + "\n", encoding="utf-8")
+
+    srt_path = audio_path.with_suffix(".srt")
+    with srt_path.open("w", encoding="utf-8") as f:
+        for i, seg in enumerate(result.get("segments", []), 1):
+            f.write(f"{i}\n{_srt_ts(seg['start'])} --> {_srt_ts(seg['end'])}\n{seg['text'].strip()}\n\n")
+
+    console.print(f"[green]✓ Transkript: {txt_path.name}[/green]")
+    return True
+
+
+def _srt_ts(seconds: float) -> str:
+    ms = int(round(seconds * 1000))
+    h, ms = divmod(ms, 3600_000)
+    m, ms = divmod(ms, 60_000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def download_episodes(
+    episodes: list[dict],
+    download_dir: Path,
+    transcribe: bool = False,
+    whisper_model: str = DEFAULT_WHISPER_MODEL,
+    whisper_language: str | None = DEFAULT_WHISPER_LANGUAGE,
+):
     """Lädt mehrere Episoden mit Fortschrittsanzeige herunter."""
     download_dir.mkdir(parents=True, exist_ok=True)
 
@@ -242,10 +336,14 @@ def download_episodes(episodes: list[dict], download_dir: Path):
     console.print(f"\n[bold green]📥 Starte Download von {len(episodes)} Episoden[/bold green]")
     if total_size:
         console.print(f"[dim]   Geschätzte Gesamtgröße: {format_size(total_size)}[/dim]")
-    console.print(f"[dim]   Zielordner: {download_dir}[/dim]\n")
+    console.print(f"[dim]   Zielordner: {download_dir}[/dim]")
+    if transcribe:
+        console.print(f"[dim]   Transkription: Whisper-Modell '{whisper_model}' ({whisper_language or 'auto'})[/dim]")
+    console.print()
 
     success_count = 0
     fail_count = 0
+    downloaded_paths: list[Path] = []
 
     with Progress(
         SpinnerColumn(),
@@ -262,8 +360,15 @@ def download_episodes(episodes: list[dict], download_dir: Path):
 
             if download_episode(episode, download_dir, progress, task_id):
                 success_count += 1
+                downloaded_paths.append(episode_filepath(episode, download_dir))
             else:
                 fail_count += 1
+
+    if transcribe and downloaded_paths:
+        console.print(f"\n[bold cyan]🎙️  Starte Transkription von {len(downloaded_paths)} Episoden[/bold cyan]")
+        for path in downloaded_paths:
+            if path.exists():
+                transcribe_file(path, whisper_model, whisper_language)
 
     # Zusammenfassung
     console.print()
@@ -490,12 +595,31 @@ def interactive_mode(download_dir: Path):
         )
         podcast_dir = Path(custom_dir)
 
+        # Transkription?
+        transcribe = Confirm.ask(
+            "\n[bold]🎙️  Episoden nach Download transkribieren (Whisper)?[/bold]",
+            default=False,
+        )
+        model_name = DEFAULT_WHISPER_MODEL
+        if transcribe:
+            model_name = Prompt.ask(
+                "[bold]Whisper-Modell[/bold]",
+                choices=["tiny", "base", "small", "medium", "large"],
+                default=DEFAULT_WHISPER_MODEL,
+            )
+
         # Bestätigung
         if Confirm.ask(
             f"\n[bold]📥 {len(selected)} Episoden nach [cyan]{podcast_dir}[/cyan] herunterladen?[/bold]",
             default=True,
         ):
-            download_episodes(selected, podcast_dir)
+            download_episodes(
+                selected,
+                podcast_dir,
+                transcribe=transcribe,
+                whisper_model=model_name,
+                whisper_language=DEFAULT_WHISPER_LANGUAGE,
+            )
 
         if not Confirm.ask("\n[bold]Weiteren Podcast herunterladen?[/bold]", default=True):
             console.print("[dim]Auf Wiederhören! 👋[/dim]")
@@ -550,7 +674,13 @@ def cli_mode(args):
             selected = episodes
 
         podcast_dir = download_dir / sanitize_filename(podcast_info["title"])
-        download_episodes(selected, podcast_dir)
+        download_episodes(
+            selected,
+            podcast_dir,
+            transcribe=args.transcribe,
+            whisper_model=args.whisper_model,
+            whisper_language=args.whisper_language,
+        )
         return
 
 
@@ -575,8 +705,18 @@ Beispiele:
     parser.add_argument("--output", "-o", help=f"Download-Verzeichnis (Standard: {DEFAULT_DOWNLOAD_DIR})")
     parser.add_argument("--limit", type=int, help="Max. Suchergebnisse (Standard: 10)")
     parser.add_argument("--json", action="store_true", help="Ausgabe als JSON")
+    parser.add_argument("--transcribe", "-t", action="store_true",
+                        help="Episoden nach Download mit Whisper transkribieren (.txt + .srt)")
+    parser.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL,
+                        choices=["tiny", "base", "small", "medium", "large"],
+                        help=f"Whisper-Modell (Standard: {DEFAULT_WHISPER_MODEL})")
+    parser.add_argument("--whisper-language", default=DEFAULT_WHISPER_LANGUAGE,
+                        help=f"Sprache für Whisper (z.B. 'de', 'en', 'auto'). Standard: {DEFAULT_WHISPER_LANGUAGE}")
 
     args = parser.parse_args()
+
+    if args.whisper_language and args.whisper_language.lower() == "auto":
+        args.whisper_language = None
 
     # Wenn keine Argumente → interaktiver Modus
     if not args.search and not args.feed:

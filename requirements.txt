@@ -1,3 +1,4 @@
 requests
 feedparser
 rich
+openai-whisper
